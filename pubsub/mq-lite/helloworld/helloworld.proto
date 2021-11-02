@@ -1,0 +1,123 @@
+// Copyright 2015 gRPC authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+
+option go_package = "google.golang.org/grpc/examples/helloworld/helloworld";
+//option go_package = "mqlite";
+//option java_package = "io.grpc.examples.messagebus";
+
+
+package lamta.framework.eventbus.grpc;
+
+// The greeting service definition.
+service MessageBus {
+  // Sends a greeting
+  rpc SayHello (HelloRequest) returns (HelloReply) {}
+
+  // Sends another greeting
+  rpc SayHelloAgain (HelloRequest) returns (HelloReply) {}
+
+
+  rpc Publish (LamtaEventInfo) returns (LamtaGrpcResponse) {}    // A: publish to all
+  //rpc subscribe (stream LamtaEventSubscibeRequest) returns (stream LamtaGrpcEventResponse) {} // check to make sure same perosn doesn't subscribe twice
+  // use stream for unsubscribe
+
+  rpc Subscribe (stream LamtaEventSubscribeRequest) returns (stream LamtaGrpcEventResponse) {}
+
+}
+
+// The request message containing the user's name.
+message HelloRequest {
+  string name = 1;
+}
+
+// The response message containing the greetings
+message HelloReply {
+  string message = 1;
+}
+
+enum LamtaGrpcDataType {
+    PROTOBUF_V3 = 0;
+    JSON_UTF8 = 1;
+}
+
+enum LamtaGrpcMessageType { // TODO: who is using this?
+    INFO = 0x0;
+    WARNING = 0x1;
+    ERROR = 0x2;
+    DEBUG = 0x3;
+
+    // reserved for future use
+    USER_VISIBLE = 0x100;
+
+}
+
+
+
+
+message LamtaGrpcData {
+    LamtaGrpcDataType kind = 1;
+    string schema = 2; // unique id to identify a data structure
+    bytes data = 3;
+}
+
+
+message LamtaEventInfo {
+    string source = 1;
+    int32 priority = 2;
+    string subject = 3;
+    string tracking = 4;
+    LamtaGrpcData data = 5;
+    bytes dapr = 6;
+}
+
+
+message LamtaEvent {
+    int64 timestampe = 1;
+    LamtaEventInfo basic = 2;
+}
+
+
+message LamtaEventSubscribeRequest {
+    string subscriber = 1; 
+    int32 flags = 2; // reserved // Use this for cancel -1 for cancel
+    repeated string subjects = 3; // a subject filter, i.e. lamta.rm.matrix.status.* // repeated means multiple subsjects?
+    bool disconnect = 4;
+    //boolean unsubscribe = 4;
+}
+
+
+message LamtaGrpcResponseMessage {
+    int32 type = 1;
+    string message = 2;
+}
+
+message LamtaGrpcEventResponse {
+    int32 code = 1;
+    repeated LamtaGrpcResponseMessage messages = 2;
+    LamtaEvent event = 3;
+    bytes dapr = 4;
+}
+
+
+
+message LamtaGrpcResponse {
+    int32 code = 1;
+    repeated LamtaGrpcResponseMessage messages = 2;
+    LamtaGrpcData data = 3;
+}
+
+
