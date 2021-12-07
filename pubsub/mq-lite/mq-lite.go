@@ -3,10 +3,13 @@ package mqlite
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"strconv"
+	"sync"
+	"time"
 
 	"github.com/dapr/components-contrib/pubsub"
 	"github.com/dapr/kit/logger"
@@ -16,21 +19,30 @@ import (
 )
 
 type bus struct {
-	ctx    context.Context
-	log    logger.Logger
-	client pb.MessageBusClient
+	ctx       context.Context
+	ctxCancel context.CancelFunc
+	log       logger.Logger
+	client    pb.MessageBusClient
 
 	address   string
 	sizeLimit int
+
+	reconnectMutex sync.RWMutex
+	reconnectTime  int
 }
 
 func New(logger logger.Logger) pubsub.PubSub {
 	return &bus{
-		log: logger,
+		log:           logger,
+		reconnectTime: 0,
+		ctxCancel:     nil,
 	}
 }
 
 func (a *bus) Close() error {
+	if a.ctxCancel != nil {
+		a.ctxCancel()
+	}
 	return nil
 }
 
@@ -60,16 +72,89 @@ func (a *bus) Init(metadata pubsub.Metadata) error {
 		a.sizeLimit = -1
 	}
 
-	a.ctx = context.Background()
-	// ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	// defer cancel()
-
-	// Set up a connection to the server.
-	conn, err := grpc.Dial(a.address, grpc.WithInsecure(), grpc.WithBlock())
+	a.reconnectMutex.Lock()
+	defer a.reconnectMutex.Unlock()
+	err := a.initGrpcClientWithRetry()
 	if err != nil {
-		log.Fatalf("did not connect: %v", err)
+		log.Printf("failed to connect gRPC. No more retry")
+		return err
 	}
+
+	return nil
+}
+
+// steps to reconnect
+// - lock reconnectMutex
+// - try the previously failing operation again
+// - only if it fails, call initGrpcClientWithRetry
+// (in case some other thread has already fixed the connection while being blocked by reconnectMutex)
+func (a *bus) initGrpcClientWithRetry() error {
+	reconnectionInterval := 60
+	if time.Now().Unix()-int64(a.reconnectTime) < int64(reconnectionInterval) {
+		errStr := "error:  gRPC connection failed. too many reconnection! the last reconnection was " + (strconv.Itoa(reconnectionInterval)) + " seconds ago. " +
+			" exiting."
+
+		log.Println(errStr)
+		//log.Fatal(errStr)
+		return errors.New(errStr)
+	}
+
+	// set reconnectTime when exiting
+	reconnectTimeFunc := func() {
+		a.reconnectTime = int(time.Now().Unix())
+	}
+	defer reconnectTimeFunc()
+
+	// cancel the old context (myCancel), and create a new connection
+	myDialFn := func(myAddress string, myCancel context.CancelFunc) (*grpc.ClientConn, context.Context, context.CancelFunc, error) {
+		if myCancel != nil {
+			myCancel()
+		}
+		ctx2, cancel2 := context.WithCancel(context.Background())
+		var conn *grpc.ClientConn
+		var err error
+
+		done := make(chan error)
+		go func() {
+			conn, err = grpc.DialContext(ctx2, myAddress, grpc.WithInsecure(), grpc.WithBlock())
+			done <- err
+		}()
+
+		// only wait 1 second to connect
+		select {
+		case ret := <-done:
+			return conn, ctx2, cancel2, ret
+		case <-time.After(1 * time.Second):
+			cancel2()
+			return nil, nil, nil, errors.New("gRPC dial time out")
+		}
+	}
+
+	conn, ctx, ctxCancel, err := myDialFn(a.address, a.ctxCancel)
+
+	retries := 3
+
+	i := 0
+	for i < retries && err != nil {
+
+		log.Printf("failed to connect: %v\n", err)
+		log.Printf("attempting to reconnect...")
+
+		conn, ctx, ctxCancel, err = myDialFn(a.address, a.ctxCancel)
+
+		// wait a bit until next attempt to reconnect
+		time.Sleep(3 * time.Second)
+		i += 1
+	}
+	if err != nil {
+		log.Printf("failed to reconnect")
+		return err
+	}
+
 	a.client = pb.NewMessageBusClient(conn)
+	a.ctx = ctx
+	a.ctxCancel = ctxCancel
+	log.Printf("gRPC connection successful")
 
 	return nil
 }
@@ -83,8 +168,6 @@ type DaprReqData struct {
 }
 
 func (a *bus) Publish(req *pubsub.PublishRequest) error {
-
-	//log.Printf("\nmy mq-lite gRPC publish()\n")
 
 	myTopic := req.Topic
 
@@ -107,13 +190,30 @@ func (a *bus) Publish(req *pubsub.PublishRequest) error {
 		priority = -1
 	}
 
-	response, err := a.client.Publish(a.ctx,
-		&pb.LamtaEventInfo{Source: "this_is_dapr_source", Priority: int32(priority), Subject: myTopic,
-			Data: &pb.LamtaGrpcData{Kind: pb.LamtaGrpcDataType_PROTOBUF_V3, Schema: "this_is_a_schema", Data: []byte(req.Data)}})
+	payload := &pb.LamtaEventInfo{Source: "this_is_dapr_source", Priority: int32(priority), Subject: myTopic,
+		Data: &pb.LamtaGrpcData{Kind: pb.LamtaGrpcDataType_PROTOBUF_V3, Schema: "this_is_a_schema", Data: []byte(req.Data)}}
+
+	response, err := a.client.Publish(a.ctx, payload)
 
 	if err != nil {
-		log.Println(err)
-		return err
+		a.reconnectMutex.Lock()
+		defer a.reconnectMutex.Unlock()
+		// try again, maybe someone else reconnected already
+		response, err = a.client.Publish(a.ctx, payload)
+		if err != nil {
+			err = a.initGrpcClientWithRetry()
+			if err != nil {
+				log.Printf("failed to connect gRPC. No more retry")
+				return err
+			}
+			response, err = a.client.Publish(a.ctx, payload)
+
+			// failed after reconnect
+			if err != nil {
+				log.Println(err)
+				return err
+			}
+		}
 	}
 
 	if response.Code != 123 {
@@ -126,33 +226,121 @@ func (a *bus) Publish(req *pubsub.PublishRequest) error {
 
 func (a *bus) Subscribe(req pubsub.SubscribeRequest, handler pubsub.Handler) error {
 
-	// log.Printf("\nmy mq-lite gRPC subscribe()\n")
-
 	go func() {
 		myTopic := req.Topic
 
-		stream, err := a.client.Subscribe(context.TODO())
+		stream, err := a.client.Subscribe(a.ctx)
 		if err != nil {
-			log.Printf("rpc error: %v\n", err)
+			a.reconnectMutex.Lock()
+			// try again, maybe someone else reconnected already
+			stream, err = a.client.Subscribe(a.ctx)
+			if err != nil {
+				err = a.initGrpcClientWithRetry()
+				if err != nil {
+					log.Printf("failed to connect gRPC. No more retry")
+					a.reconnectMutex.Unlock()
+					return
+				}
+				stream, err = a.client.Subscribe(a.ctx)
+				if err != nil {
+					log.Println(err)
+					a.reconnectMutex.Unlock()
+					return
+				}
+			}
+			a.reconnectMutex.Unlock()
 		}
 
 		myTopics := []string{(myTopic)}
 
-		stream.Send(&pb.LamtaEventSubscribeRequest{
+		err = stream.Send(&pb.LamtaEventSubscribeRequest{
 			Subjects: myTopics,
 		})
+
+		if err != nil {
+			a.reconnectMutex.Lock()
+			// try again, maybe someone else reconnected already
+			stream, err = a.client.Subscribe(a.ctx)
+			if err == nil {
+				err = stream.Send(&pb.LamtaEventSubscribeRequest{
+					Subjects: myTopics,
+				})
+			}
+			if err != nil {
+				err = a.initGrpcClientWithRetry()
+				if err != nil {
+					log.Printf("failed to connect. No more reconnect")
+					log.Println(err)
+					a.reconnectMutex.Unlock()
+					return
+				}
+				// ignore error, let it fail later
+				stream, _ = a.client.Subscribe(a.ctx)
+				err = stream.Send(&pb.LamtaEventSubscribeRequest{
+					Subjects: myTopics,
+				})
+				if err != nil {
+					log.Println(err)
+					a.reconnectMutex.Unlock()
+					return
+				}
+			}
+
+		}
 
 		for {
 			lamtaGrpcEventResponse, err := stream.Recv()
 
-			if err := handler(a.ctx, &pubsub.NewMessage{Data: []byte(lamtaGrpcEventResponse.Event.Basic.Data.Data), Topic: req.Topic, Metadata: req.Metadata}); err != nil {
+			if err != nil {
+				a.reconnectMutex.Lock()
+				// try again, maybe someone else reconnected already
+				stream, err = a.client.Subscribe(a.ctx)
+				if err == nil {
+					err = stream.Send(&pb.LamtaEventSubscribeRequest{
+						Subjects: myTopics,
+					})
+					if err == nil {
+						lamtaGrpcEventResponse, err = stream.Recv()
+					}
+				}
+				if err != nil {
+
+					err = a.initGrpcClientWithRetry()
+					a.reconnectMutex.Unlock()
+					if err != nil {
+						log.Printf("failed to connect. No more reconnect")
+						log.Println(err)
+						return
+					} else {
+						// reconnect successful, now set up the subscription again,
+						// and run the loop again
+						stream, err = a.client.Subscribe(a.ctx)
+						if err == nil {
+							err = stream.Send(&pb.LamtaEventSubscribeRequest{
+								Subjects: myTopics,
+							})
+							if err != nil {
+								log.Printf("failed to connect. No more reconnect")
+								log.Println(err)
+								return
+
+							}
+						}
+						continue
+					}
+				}
+			}
+
+			err = handler(a.ctx, &pubsub.NewMessage{Data: []byte(lamtaGrpcEventResponse.Event.Basic.Data.Data), Topic: req.Topic, Metadata: req.Metadata})
+
+			if err == io.EOF {
+				log.Println("Received EOF, skipping")
 				continue
 			}
-			if err == io.EOF {
-				break
-			}
 			if err != nil {
-				log.Printf("rpc error: %v\n", err)
+				log.Println("error running handler on payload. payload below:")
+				log.Println([]byte(lamtaGrpcEventResponse.Event.Basic.Data.Data))
+				log.Println(err)
 			}
 		}
 
@@ -166,5 +354,6 @@ func (a *bus) Subscribe(req pubsub.SubscribeRequest, handler pubsub.Handler) err
 		// time.Sleep(time.Second)
 
 	}()
+
 	return nil
 }
